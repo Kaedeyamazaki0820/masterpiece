@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>My Masterpiece Collection</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 20px; }
+    h1 { margin: 0 0 8px; }
+    .sub { margin: 0 0 16px; color: #333; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0 18px; }
+    .pill { border: 1px solid #ddd; padding: 6px 10px; border-radius: 999px; font-size: 13px; }
+    .btn { border: 1px solid #ddd; background: #fff; padding: 6px 10px; border-radius: 10px; font-size: 13px; cursor: pointer; }
+    .btn:hover { background: #f6f6f6; }
+    .hint { font-size: 12px; color: #666; margin-top: 6px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 16px; }
+    .card { cursor: pointer; user-select: none; }
+    .card img { width: 100%; aspect-ratio: 3/4; object-fit: cover; border-radius: 10px; transition: 0.2s; background: #f1f1f1; }
+    .unseen img { filter: grayscale(100%); opacity: 0.6; }
+    .meta { margin-top: 6px; line-height: 1.25; font-size: 13px; }
+    .meta small { color: #666; }
+    .status { margin: 10px 0 14px; font-size: 13px; color: #333; }
+    .bar { width: 280px; max-width: 100%; height: 10px; background: #eee; border-radius: 999px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0%; background: #333; }
+    .error { padding: 12px; border: 1px solid #f1c2c2; background: #fff0f0; border-radius: 10px; }
+    .error code { display: block; margin-top: 8px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>My Masterpiece Collection</h1>
+  <p class="sub">クリックで「見た」を切替（ブラウザに保存）。王道名画はWikidataから自動取得。</p>
+
+  <div class="topbar">
+    <div class="pill" id="countPill">読み込み中…</div>
+    <div class="bar" aria-label="progress"><div id="progressFill"></div></div>
+    <button class="btn" id="filterBtn">未見だけ表示：OFF</button>
+    <button class="btn" id="resetBtn">見た履歴をリセット</button>
+    <button class="btn" id="refreshBtn">作品リスト再取得</button>
+  </div>
+  <div class="hint">※最初の取得は少し時間がかかることがあります。混雑時は504/429が出るので、リトライ＆キャッシュで回避します。</div>
+
+  <div class="status" id="status"></div>
+  <div id="errorBox" class="error" style="display:none;"></div>
+
+  <div class="grid" id="gallery"></div>
+
+<script>
+/**
+ * ===== ここからJS =====
+ * 学びポイント：
+ * 1) 外部データ取得は「非同期」(async/await)
+ * 2) 取得したデータはアプリ用の形に「正規化」
+ * 3) ネットは失敗するので「リトライ」
+ * 4) APIに負荷をかけないため「キャッシュ」
+ */
+
+const STORAGE_KEY = "seenItems_v1";            // 見た履歴
+const CACHE_KEY   = "masterpieces_cache_v2";   // 作品リストのキャッシュ
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;      // 24時間キャッシュ
+
+// 初期設定：重いと落ちるので、まずは60件（動いたら120に上げてOK）
+const LIMIT = 60;
+
+let unseenOnly = false;
+let masterpieces = [];
+
+// ===== SPARQL（Wikidataに「名画をください」と聞くクエリ）=====
+function buildSparql(limit = LIMIT) {
+  return `
+SELECT ?item ?itemLabel ?creatorLabel ?image ?sitelinks WHERE {
+  ?item wdt:P31 wd:Q3305213;      # instance of: painting
+        wdt:P18 ?image.          # has image
+  OPTIONAL { ?item wdt:P170 ?creator. }   # creator (artist)
+  ?item wikibase:sitelinks ?sitelinks.    # popularity proxy (どれだけ各wikiにリンクされてるか)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en,ja". }
+}
+ORDER BY DESC(?sitelinks)
+LIMIT ${limit}
+`;
+}
+
+// Wikimediaの画像URLを軽いサムネにする（高速化）
+function toThumb(url, width = 360) {
+  try {
+    const u = new URL(url);
+    u.searchParams.set("width", String(width));
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+// 見た履歴の読み書き
+function getSeen() {
+  return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+}
+function setSeen(arr) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+}
+
+// 作品リストのキャッシュ
+function getCache() {
+  return JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+}
+function setCache(data) {
+  localStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt: Date.now(), data }));
+}
+function clearCache() {
+  localStorage.removeItem(CACHE_KEY);
+}
+
+// UI要素
+const gallery = document.getElementById("gallery");
+const statusEl = document.getElementById("status");
+const countPill = document.getElementById("countPill");
+const progressFill = document.getElementById("progressFill");
+const filterBtn = document.getElementById("filterBtn");
+const resetBtn = document.getElementById("resetBtn");
+const refreshBtn = document.getElementById("refreshBtn");
+const errorBox = document.getElementById("errorBox");
+
+// ===== Wikidata取得（POST + リトライ + キャッシュ）=====
+async function fetchMasterpieces() {
+  // 1) キャッシュが有効ならそれを使う
+  const cached = getCache();
+  if (cached && (Date.now() - cached.savedAt) < CACHE_TTL_MS) {
+    statusEl.textContent = "キャッシュから作品リストを読み込みました。";
+    return cached.data;
+  }
+
+  // 2) キャッシュがないならWikidataへ
+  statusEl.textContent = "Wikidataから作品リストを取得中…";
+  const sparql = buildSparql(LIMIT);
+  const endpoint = "https://query.wikidata.org/sparql";
+
+  const maxTries = 4; // 504/429対策
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Accept": "application/sparql-results+json",
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+        },
+        body: "query=" + encodeURIComponent(sparql)
+      });
+
+      // 429（叩きすぎ）や 5xx は待ってリトライしたい
+      if (!res.ok) {
+        const msg = `Wikidata fetch failed: ${res.status} ${res.statusText}`;
+        if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+          throw new Error(msg);
+        }
+        // それ以外は即エラーにする
+        throw new Error(msg);
+      }
+
+      const json = await res.json();
+
+      // 3) 正規化：Wikidataの形 → アプリ用の形
+      const rows = json.results.bindings.map(b => {
+        const itemUrl = b.item.value;       // https://www.wikidata.org/entity/Q....
+        const id = itemUrl.split("/").pop(); // Qxxxx（一意ID）
+        return {
+          id,
+          title: b.itemLabel?.value ?? id,
+          artist: b.creatorLabel?.value ?? "Unknown",
+          image: toThumb(b.image.value, 360),
+          popularity: Number(b.sitelinks?.value ?? 0)
+        };
+      });
+
+      // 重複除去（念のため）
+      const seen = new Set();
+      const unique = rows.filter(x => (seen.has(x.id) ? false : (seen.add(x.id), true)));
+
+      setCache(unique);
+      statusEl.textContent = "Wikidataから取得しました（キャッシュ保存済み）。";
+      return unique;
+
+    } catch (e) {
+      // リトライ待ち（指数バックオフ）
+      const waitMs = 900 * attempt;
+      statusEl.textContent = `取得に失敗（${attempt}/${maxTries}）。${Math.round(waitMs/1000)}秒待って再試行…`;
+      await new Promise(r => setTimeout(r, waitMs));
+      if (attempt === maxTries) throw e;
+    }
+  }
+}
+
+// ===== 描画（render）=====
+function updateProgressUI(total, seenCount) {
+  countPill.textContent = `見た：${seenCount} / ${total}`;
+  const pct = total ? Math.round((seenCount / total) * 100) : 0;
+  progressFill.style.width = `${pct}%`;
+}
+
+function render() {
+  const seenItems = getSeen();
+  const total = masterpieces.length;
+
+  // フィルター（未見だけ）
+  const list = unseenOnly
+    ? masterpieces.filter(m => !seenItems.includes(m.id))
+    : masterpieces;
+
+  gallery.innerHTML = "";
+  list.forEach(item => {
+    const isSeen = seenItems.includes(item.id);
+    const card = document.createElement("div");
+    card.className = "card " + (isSeen ? "" : "unseen");
+
+    card.innerHTML = `
+      <img src="${item.image}" alt="${escapeHtml(item.title)}" loading="lazy">
+      <div class="meta">
+        ${escapeHtml(item.title)}<br>
+        <small>${escapeHtml(item.artist)}</small>
+      </div>
+    `;
+
+    card.onclick = () => {
+      let next = getSeen();
+      if (next.includes(item.id)) {
+        next = next.filter(id => id !== item.id);
+      } else {
+        next.push(item.id);
+      }
+      setSeen(next);
+      render(); // UI更新（簡単に再描画）
+    };
+
+    gallery.appendChild(card);
+  });
+
+  updateProgressUI(total, seenItems.length);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;" }[c]
+  ));
+}
+
+// ===== ボタン =====
+filterBtn.onclick = () => {
+  unseenOnly = !unseenOnly;
+  filterBtn.textContent = `未見だけ表示：${unseenOnly ? "ON" : "OFF"}`;
+  render();
+};
+
+resetBtn.onclick = () => {
+  if (!confirm("見た履歴をリセットする？（このブラウザの保存が消えます）")) return;
+  setSeen([]);
+  render();
+};
+
+refreshBtn.onclick = async () => {
+  if (!confirm("作品リストを再取得する？（キャッシュを消してWikidataに取りに行きます）")) return;
+  clearCache();
+  await boot();
+};
+
+// ===== 起動（boot）=====
+async function boot() {
+  errorBox.style.display = "none";
+  errorBox.innerHTML = "";
+  statusEl.textContent = "起動中…";
+
+  try {
+    masterpieces = await fetchMasterpieces();
+    render();
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "読み込みに失敗しました。";
+    errorBox.style.display = "block";
+    errorBox.innerHTML = `
+      <div><strong>取得に失敗</strong>：Wikidataが混雑している可能性があります。</div>
+      <div>少し待ってから「作品リスト再取得」またはページ更新を試してください。</div>
+      <code>${escapeHtml(e?.message || e)}</code>
+    `;
+  }
+}
+
+boot();
+</script>
+</body>
+</html>
