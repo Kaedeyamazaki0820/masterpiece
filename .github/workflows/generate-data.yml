@@ -27,7 +27,7 @@ jobs:
       - name: Generate data.json
         run: node scripts/generate-data.mjs
         env:
-          LIMIT: "120"
+          LIMIT: "20"
 
       - name: Commit and push if changed
         run: |
